@@ -1,0 +1,337 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Screen Monitor</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            background: #0a0a0a; color: #e0e0e0;
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
+            height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+        }
+        .header {
+            display: flex; justify-content: space-between; align-items: center;
+            padding: 10px 20px; background: #141414;
+            border-bottom: 1px solid #222; flex-shrink: 0;
+        }
+        .header h1 { font-size: 16px; font-weight: 600; color: #fff; }
+        .header-right { display: flex; align-items: center; gap: 10px; }
+        .status-dot {
+            width: 9px; height: 9px; border-radius: 50%;
+            background: #555; transition: background 0.3s;
+        }
+        .status-dot.ok { background: #4caf50; box-shadow: 0 0 6px rgba(76,175,80,0.5); }
+        .status-dot.err { background: #f44336; }
+        .stat {
+            font-size: 11px; color: #777;
+            font-family: 'Courier New', monospace;
+            background: #1a1a1a; padding: 3px 7px;
+            border-radius: 3px; border: 1px solid #2a2a2a;
+        }
+        #statusText { font-size: 12px; color: #888; }
+        .canvas-container {
+            flex: 1; display: flex; align-items: center; justify-content: center;
+            position: relative; background: #000; overflow: hidden; min-height: 0;
+        }
+        #screenCanvas { display: block; }
+        .overlay {
+            position: absolute; inset: 0;
+            background: rgba(0,0,0,0.88);
+            display: flex; align-items: center; justify-content: center;
+            z-index: 5; transition: opacity 0.3s;
+        }
+        .overlay.hidden { opacity: 0; pointer-events: none; }
+        .overlay-content { text-align: center; }
+        .spinner {
+            width: 36px; height: 36px;
+            border: 3px solid #333; border-top-color: #4caf50;
+            border-radius: 50%; animation: spin 0.8s linear infinite;
+            margin: 0 auto 14px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .overlay-content p { color: #777; font-size: 13px; }
+        .controls {
+            display: flex; align-items: center; gap: 6px;
+            padding: 8px 20px; background: #141414;
+            border-top: 1px solid #222; flex-shrink: 0;
+        }
+        .btn {
+            padding: 5px 14px; border: 1px solid #333; border-radius: 3px;
+            background: #1e1e1e; color: #bbb; font-size: 11px;
+            cursor: pointer; transition: all 0.15s;
+        }
+        .btn:hover { background: #2a2a2a; border-color: #555; }
+        .btn.on { background: #1565c0; border-color: #1565c0; color: #fff; }
+        .btn-start {
+            padding: 6px 20px; border: none; border-radius: 4px;
+            background: #2e7d32; color: #fff;
+            font-size: 13px; font-weight: 600;
+            cursor: pointer; transition: all 0.15s;
+        }
+        .btn-start:hover { background: #388e3c; }
+        .btn-start.active { background: #c62828; }
+        .btn-start.active:hover { background: #d32f2f; }
+        .spacer { flex: 1; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Screen Monitor</h1>
+        <div class="header-right">
+            <div class="status-dot" id="dot"></div>
+            <span id="statusText">Connecting...</span>
+            <span class="stat" id="fpsStat">-- fps</span>
+            <span class="stat" id="frameStat">0 frames</span>
+            <span class="stat" id="dropStat">0 dropped</span>
+            <span class="stat" id="resStat">--</span>
+        </div>
+    </div>
+    <div class="canvas-container">
+        <canvas id="screenCanvas"></canvas>
+        <div class="overlay" id="overlay">
+            <div class="overlay-content">
+                <div class="spinner"></div>
+                <p id="overlayText">Waiting for device...</p>
+            </div>
+        </div>
+    </div>
+    <div class="controls">
+        <button class="btn-start" id="btnStream">START</button>
+        <button class="btn" id="btnFs">Fullscreen</button>
+        <button class="btn on" id="btnFit">Fit</button>
+        <button class="btn" id="btnStretch">Stretch</button>
+        <span class="spacer"></span>
+        <span class="stat" id="latencyStat">latency: --</span>
+    </div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script>
+    (() => {
+        'use strict';
+
+        const canvas = document.getElementById('screenCanvas');
+        const ctx = canvas.getContext('2d', { alpha: false });
+        const overlay = document.getElementById('overlay');
+        const overlayText = document.getElementById('overlayText');
+        const dot = document.getElementById('dot');
+        const statusText = document.getElementById('statusText');
+        const fpsStat = document.getElementById('fpsStat');
+        const frameStat = document.getElementById('frameStat');
+        const dropStat = document.getElementById('dropStat');
+        const resStat = document.getElementById('resStat');
+        const latencyStat = document.getElementById('latencyStat');
+        const btnStream = document.getElementById('btnStream');
+
+        let displayMode = 'fit';
+        let isStreaming = false;
+        let frameCount = 0;
+        let dropCount = 0;
+        let lastFrameTime = 0;
+
+        // FPS tracking
+        let fpsWindow = [];
+
+        // Latest image ready to draw
+        let currentImage = null;
+        let needsDraw = false;
+
+        // Pre-create Image object for reuse
+        const img = new Image();
+        let imgReady = false;
+
+        // ===== Socket.IO =====
+        const socket = io(window.location.origin, {
+            transports: ['websocket', 'polling'],
+            reconnection: true,
+            reconnectionDelay: 1000,
+            reconnectionDelayMax: 5000
+        });
+
+        socket.on('connect', () => {
+            socket.emit('register-dashboard');
+            setStatus('ok', 'Connected');
+        });
+
+        socket.on('disconnect', () => {
+            setStatus('err', 'Disconnected');
+            overlay.classList.remove('hidden');
+            overlayText.textContent = 'Connection lost...';
+        });
+
+        socket.on('connect_error', () => {
+            setStatus('err', 'Connection error');
+        });
+
+        socket.on('android-status', (data) => {
+            if (data.connected) {
+                setStatus('ok', 'Device online');
+                if (isStreaming) overlay.classList.add('hidden');
+            } else {
+                setStatus('ok', 'Waiting for device');
+                overlay.classList.remove('hidden');
+                overlayText.textContent = 'Waiting for device...';
+            }
+        });
+
+        socket.on('rotation', (meta) => {
+            console.log(`[Rotation] ${meta.width}x${meta.height}`);
+        });
+
+        // ===== Frame Reception =====
+        // Simple approach: receive base64, create data URL, load into Image
+        socket.on('frame', (base64Data) => {
+            if (!isStreaming) return;
+
+            frameCount++;
+            const now = performance.now();
+
+            // Track FPS
+            fpsWindow.push(now);
+            // Keep only last 2 seconds of timestamps
+            while (fpsWindow.length > 0 && fpsWindow[0] < now - 2000) {
+                fpsWindow.shift();
+            }
+
+            // Update stats every 500ms
+            if (now - lastFrameTime > 500) {
+                lastFrameTime = now;
+                const fps = fpsWindow.length > 1
+                    ? ((fpsWindow.length - 1) / ((fpsWindow[fpsWindow.length-1] - fpsWindow[0]) / 1000)).toFixed(1)
+                    : '0';
+                fpsStat.textContent = `${fps} fps`;
+                frameStat.textContent = `${frameCount} frames`;
+                dropStat.textContent = `${dropCount} dropped`;
+                latencyStat.textContent = `latency: ${fps !== '0' ? Math.round(1000 / parseFloat(fps)) : '--'}ms`;
+            }
+
+            // Create data URL and load into image
+            const dataUrl = 'data:image/jpeg;base64,' + base64Data;
+
+            // Use a fresh Image each time to avoid race conditions
+            const frameImg = new Image();
+            frameImg.onload = () => {
+                // This is the latest decoded frame
+                currentImage = frameImg;
+                needsDraw = true;
+
+                // Update resolution if changed
+                if (canvas.width !== frameImg.naturalWidth || canvas.height !== frameImg.naturalHeight) {
+                    canvas.width = frameImg.naturalWidth;
+                    canvas.height = frameImg.naturalHeight;
+                    resStat.textContent = `${frameImg.naturalWidth}x${frameImg.naturalHeight}`;
+                    resizeCanvas();
+                }
+            };
+            frameImg.src = dataUrl;
+
+            // Hide overlay on first frame
+            if (!overlay.classList.contains('hidden')) {
+                overlay.classList.add('hidden');
+            }
+        });
+
+        // ===== Render Loop =====
+        function renderLoop() {
+            requestAnimationFrame(renderLoop);
+
+            if (needsDraw && currentImage) {
+                ctx.drawImage(currentImage, 0, 0);
+                needsDraw = false;
+            }
+        }
+
+        // ===== Canvas Sizing =====
+        function resizeCanvas() {
+            const container = canvas.parentElement;
+            const cw = container.clientWidth;
+            const ch = container.clientHeight;
+            if (canvas.width === 0 || canvas.height === 0) return;
+
+            if (displayMode === 'stretch') {
+                canvas.style.width = cw + 'px';
+                canvas.style.height = ch + 'px';
+            } else {
+                const aspect = canvas.width / canvas.height;
+                const containerAspect = cw / ch;
+                if (aspect > containerAspect) {
+                    canvas.style.width = cw + 'px';
+                    canvas.style.height = Math.round(cw / aspect) + 'px';
+                } else {
+                    canvas.style.height = ch + 'px';
+                    canvas.style.width = Math.round(ch * aspect) + 'px';
+                }
+            }
+        }
+
+        window.addEventListener('resize', resizeCanvas);
+        document.addEventListener('fullscreenchange', resizeCanvas);
+
+        // ===== Controls =====
+        document.getElementById('btnFit').addEventListener('click', function() {
+            displayMode = 'fit';
+            this.classList.add('on');
+            document.getElementById('btnStretch').classList.remove('on');
+            resizeCanvas();
+        });
+
+        document.getElementById('btnStretch').addEventListener('click', function() {
+            displayMode = 'stretch';
+            this.classList.add('on');
+            document.getElementById('btnFit').classList.remove('on');
+            resizeCanvas();
+        });
+
+        document.getElementById('btnFs').addEventListener('click', () => {
+            if (!document.fullscreenElement) {
+                document.documentElement.requestFullscreen().catch(() => {});
+            } else {
+                document.exitFullscreen();
+            }
+        });
+
+        // ===== Start/Stop =====
+        btnStream.addEventListener('click', () => {
+            isStreaming = !isStreaming;
+            if (isStreaming) {
+                btnStream.textContent = 'STOP';
+                btnStream.classList.add('active');
+                socket.emit('start-stream');
+                frameCount = 0;
+                dropCount = 0;
+                fpsWindow = [];
+                console.log('[Dashboard] Stream STARTED');
+            } else {
+                btnStream.textContent = 'START';
+                btnStream.classList.remove('active');
+                socket.emit('stop-stream');
+                // Clear canvas
+                if (canvas.width > 0 && canvas.height > 0) {
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                }
+                currentImage = null;
+                needsDraw = false;
+                fpsStat.textContent = '-- fps';
+                frameStat.textContent = '0 frames';
+                dropStat.textContent = '0 dropped';
+                latencyStat.textContent = 'latency: --';
+                console.log('[Dashboard] Stream STOPPED');
+            }
+        });
+
+        // ===== Helpers =====
+        function setStatus(state, text) {
+            dot.className = 'status-dot';
+            if (state === 'ok') dot.classList.add('ok');
+            else if (state === 'err') dot.classList.add('err');
+            statusText.textContent = text;
+        }
+
+        // ===== Start render loop =====
+        requestAnimationFrame(renderLoop);
+        console.log('[Dashboard] Initialized');
+    })();
+    </script>
+</body>
+</html>
